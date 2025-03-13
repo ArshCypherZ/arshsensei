@@ -1,0 +1,23 @@
+# global
+fastapi
+google-genai
+python-dotenv
+uvicorn
+
+# farmx and fraud
+pandas
+scikit-learn
+
+# farmx and policysense
+python-multipart
+
+# clarityhub
+google-api-python-client
+
+# farmx
+transformers
+pillow
+torch
+
+# fraud
+xgboost
