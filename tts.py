@@ -1,0 +1,308 @@
+#!/usr/bin/env python
+import os
+import logging
+import wave
+import re
+import tempfile
+import shutil
+import time
+import uuid
+from pathlib import Path
+from typing import Tuple, Optional, List, Any, Dict
+from dotenv import load_dotenv
+from pydub import AudioSegment
+import soundfile as sf
+import numpy as np
+from fastapi import APIRouter, HTTPException, Body, BackgroundTasks
+from fastapi.responses import FileResponse
+import uvicorn
+
+# --- Basic Logging Setup ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# --- Import Kokoro ---
+try:
+    from kokoro import KPipeline
+except ImportError:
+    logger.error("FATAL: Failed to import KPipeline from kokoro. Make sure 'kokoro' is installed correctly.")
+    KPipeline = None # Set to None if import fails
+
+# --- Kokoro Configuration (Read from environment) ---
+KOKORO_LANGUAGE_CODE = os.getenv("KOKORO_LANG_CODE", 'a') # Default to American English
+KOKORO_VOICE = os.getenv("KOKORO_VOICE", 'af_heart') # Default voice
+KOKORO_SAMPLING_RATE = 24000 # Kokoro's default sampling rate
+
+# --- Global Pipeline Variable ---
+kokoro_pipeline: Optional[KPipeline] = None
+pipeline_initialized = False
+
+# --- Helper Functions (Adapted from original script) ---
+PAUSE_REGEX = re.compile(r"(\[PAUSE=(\d+(?:\.\d+)?)\])")
+
+def ensure_dir_exists(directory_path: str):
+    """Creates a directory if it doesn't exist."""
+    if not os.path.exists(directory_path):
+        os.makedirs(directory_path)
+        logger.info(f"Created directory: {directory_path}")
+
+def get_wav_duration(file_path: str) -> Optional[float]:
+    """Calculates the duration of a WAV file using soundfile."""
+    try:
+        with sf.SoundFile(file_path) as f:
+            frames = f.frames
+            rate = f.samplerate
+            duration = frames / float(rate) if rate > 0 else 0
+            return duration
+    except Exception as e:
+        logger.error(f"Failed to get duration for WAV file {file_path} using soundfile: {e}")
+        try:
+            audio = AudioSegment.from_wav(file_path)
+            duration = len(audio) / 1000.0
+            logger.warning(f"Used pydub fallback for duration of {os.path.basename(file_path)}: {duration:.3f}s")
+            return duration
+        except Exception as pd_e:
+            logger.error(f"Pydub fallback failed for {file_path}: {pd_e}")
+            return None
+
+def _initialize_kokoro_pipeline() -> Optional[KPipeline]:
+    """Initializes the Kokoro pipeline if not already done."""
+    global kokoro_pipeline, pipeline_initialized
+    if not pipeline_initialized:
+        if KPipeline is None:
+            logger.error("Kokoro library (KPipeline) is not available.")
+            return None
+        try:
+            logger.info(f"Initializing Kokoro pipeline (lang_code='{KOKORO_LANGUAGE_CODE}')... This may take a moment.")
+            # Consider making repo_id configurable via env var if needed
+            pipeline = KPipeline(lang_code=KOKORO_LANGUAGE_CODE)
+            kokoro_pipeline = pipeline
+            pipeline_initialized = True # Mark as initialized
+            logger.info("Kokoro pipeline initialized successfully.")
+        except Exception as e:
+            logger.error(f"Failed to initialize Kokoro pipeline: {e}", exc_info=True)
+            return None
+    elif kokoro_pipeline is None:
+         # Was marked initialized but failed previously, or some other issue
+         logger.error("Pipeline initialization previously failed or pipeline is None.")
+         return None
+    return kokoro_pipeline
+
+def _generate_kokoro_segment(pipeline: KPipeline, text_segment: str, output_wav_path: str) -> Optional[float]:
+    """Generates a single audio segment using Kokoro and returns its duration."""
+    cleaned_text = PAUSE_REGEX.sub('', text_segment).strip()
+    if not cleaned_text:
+        logger.info("Skipping empty/marker-only text segment for Kokoro.")
+        return 0.0
+
+    logger.debug(f"Sending to Kokoro: '{cleaned_text[:50]}...' (Voice: {KOKORO_VOICE})")
+
+    try:
+        start_time = time.time()
+        generator: Any = pipeline(cleaned_text, voice=KOKORO_VOICE, speed=1)
+
+        all_audio_data = []
+        for _gs, _ps, audio_data in generator:
+             if audio_data is not None and len(audio_data) > 0:
+                 all_audio_data.append(audio_data)
+
+        if not all_audio_data:
+             logger.warning(f"Kokoro generated no audio data for segment: {cleaned_text[:50]}...")
+             return 0.0
+
+        final_audio_data = np.concatenate(all_audio_data) if len(all_audio_data) > 1 else all_audio_data[0]
+        end_time = time.time()
+        logger.debug(f"Kokoro segment generation took {end_time - start_time:.2f} seconds.")
+
+        sf.write(output_wav_path, final_audio_data, KOKORO_SAMPLING_RATE)
+        duration = len(final_audio_data) / float(KOKORO_SAMPLING_RATE)
+        return duration
+
+    except Exception as e:
+        logger.error(f"Error during Kokoro segment generation for text: {cleaned_text[:50]}... Error: {e}", exc_info=True)
+        return None
+
+def _process_audio_generation(narration_script: str, request_id: str) -> Tuple[Optional[str], Optional[float], Optional[List[float]]]:
+    """
+    Core logic to generate audio, adapted for API context.
+    Returns final path, total duration, and segment durations.
+    Saves file to a temporary location specific to the request.
+    """
+    pipeline = _initialize_kokoro_pipeline()
+    if pipeline is None:
+        logger.error("Kokoro pipeline is not available. Cannot generate audio.")
+        return None, None, None
+
+    # Create a unique temporary directory for this request's processing
+    request_temp_dir = tempfile.mkdtemp(prefix=f"kokoro_api_{request_id}_")
+    final_output_filename = f"output_{request_id}.wav"
+    final_output_filepath = os.path.join(request_temp_dir, final_output_filename)
+    logger.info(f"[{request_id}] Generating audio with Kokoro TTS...")
+
+    parts = PAUSE_REGEX.split(narration_script)
+    parts = [p for p in parts if p]
+
+    combined_audio = AudioSegment.empty()
+    segment_durations: List[float] = []
+    temp_segment_dir = os.path.join(request_temp_dir, "segments")
+    ensure_dir_exists(temp_segment_dir)
+    logger.debug(f"[{request_id}] Using temp segment directory: {temp_segment_dir}")
+    success = True
+
+    try:
+        segment_index = 0
+        for i, part in enumerate(parts):
+            match = PAUSE_REGEX.match(part)
+            if match:
+                pause_duration_str = match.group(2)
+                try:
+                    pause_duration_ms = int(float(pause_duration_str) * 1000)
+                    if pause_duration_ms > 0:
+                        logger.debug(f"[{request_id}] Adding {pause_duration_ms}ms silence.")
+                        combined_audio += AudioSegment.silent(duration=pause_duration_ms)
+                except ValueError:
+                    logger.warning(f"[{request_id}] Invalid pause duration format: {part}. Ignoring pause.")
+            else:
+                text_segment = part.strip()
+                if not text_segment: continue
+
+                segment_filename = os.path.join(temp_segment_dir, f"segment_{segment_index}.wav")
+                segment_duration = _generate_kokoro_segment(pipeline, text_segment, segment_filename)
+
+                if segment_duration is not None:
+                    if segment_duration > 0.01:
+                        try:
+                            audio_segment = AudioSegment.from_wav(segment_filename)
+                            combined_audio += audio_segment
+                            segment_durations.append(segment_duration)
+                            segment_index += 1
+                        except Exception as e:
+                             logger.error(f"[{request_id}] Failed to load generated segment {segment_filename}: {e}", exc_info=True)
+                             success = False; break
+                    else:
+                         logger.info(f"[{request_id}] Skipping segment {segment_index} due to zero duration.")
+                else:
+                    logger.error(f"[{request_id}] Failed to generate audio for segment: {text_segment[:50]}...")
+                    success = False; break
+
+        if not success or len(combined_audio) == 0:
+             logger.error(f"[{request_id}] Audio generation failed or resulted in empty audio.")
+             # Cleanup happens in the finally block
+             return None, None, None
+
+        logger.info(f"[{request_id}] Exporting combined audio ({len(combined_audio) / 1000.0:.2f}s) to {final_output_filepath}")
+        combined_audio.export(final_output_filepath, format="wav")
+
+        total_duration = get_wav_duration(final_output_filepath)
+        if total_duration is None:
+             logger.warning(f"[{request_id}] Could not get duration from final file, using pydub length.")
+             total_duration = len(combined_audio) / 1000.0
+
+        logger.info(f"[{request_id}] Successfully generated final audio (Duration: {total_duration:.2f}s).")
+        logger.debug(f"[{request_id}] Speech segment durations: {segment_durations}")
+        # Return the path to the final file within its unique temp dir
+        return final_output_filepath, total_duration, segment_durations
+
+    except Exception as e:
+         logger.error(f"[{request_id}] An unexpected error occurred during audio processing: {e}", exc_info=True)
+         return None, None, None
+    # NOTE: Cleanup of request_temp_dir should happen *after* the file response is sent. See BackgroundTasks.
+
+def cleanup_temp_dir(temp_dir_path: str):
+    """Safely removes a temporary directory."""
+    try:
+        if os.path.exists(temp_dir_path):
+            shutil.rmtree(temp_dir_path)
+            logger.info(f"Cleaned up temporary directory: {temp_dir_path}")
+    except Exception as e:
+        logger.error(f"Error cleaning up temp directory {temp_dir_path}: {e}", exc_info=True)
+
+
+# --- FastAPI App ---
+router = APIRouter()
+
+@router.on_event("startup")
+async def startup_event():
+    """Initialize the pipeline on startup."""
+    logger.info("API starting up. Initializing Kokoro pipeline...")
+    if _initialize_kokoro_pipeline() is None:
+        logger.error("Kokoro pipeline failed to initialize on startup!")
+        raise RuntimeError("Kokoro pipeline failed to initialize.")
+    else:
+        logger.info("Kokoro pipeline ready.")
+
+
+@router.post("/generate_audio/",
+          response_class=FileResponse,
+          responses={
+              200: {
+                  "content": {"audio/wav": {}},
+                  "description": "Successful audio generation. Returns WAV file.",
+              },
+              422: {"description": "Validation Error (e.g., missing text)"},
+              500: {"description": "Internal Server Error (e.g., TTS failure)"},
+              503: {"description": "Service Unavailable (Kokoro not initialized)"}
+          })
+async def generate_audio_endpoint(
+    background_tasks: BackgroundTasks,
+    payload: Dict[str, Any] = Body(...)
+    ):
+    """
+    Generates audio from the provided text using Kokoro TTS.
+
+    - **payload**: JSON body containing:
+        - **text** (str): The narration script, potentially with [PAUSE=...] markers.
+    """
+    if not pipeline_initialized or kokoro_pipeline is None:
+         raise HTTPException(status_code=503, detail="Kokoro TTS service is not available.")
+
+    narration_script = payload.get("text")
+    if not narration_script or not isinstance(narration_script, str):
+        raise HTTPException(status_code=422, detail="Missing or invalid 'text' field in request body.")
+
+    request_id = str(uuid.uuid4()) # Unique ID for logging and temp files
+    logger.info(f"Received audio generation request {request_id}")
+
+    # --- Perform Generation ---
+    # Note: This runs synchronously within the request handler.
+    temp_dir_path = None # Keep track of the main temp dir for cleanup
+    try:
+        # The _process_audio_generation function creates its own temp dir based on request_id
+        # We need its path for cleanup later.
+        temp_dir_path = os.path.join(tempfile.gettempdir(), f"kokoro_api_{request_id}_")
+
+        final_output_filepath, total_duration, segment_durations = _process_audio_generation(
+            narration_script, request_id
+        )
+
+        if final_output_filepath and os.path.exists(final_output_filepath):
+            logger.info(f"[{request_id}] Sending audio file: {final_output_filepath}")
+            # Add cleanup task to run *after* the response is sent
+            background_tasks.add_task(cleanup_temp_dir, os.path.dirname(final_output_filepath))
+            return FileResponse(
+                path=final_output_filepath,
+                media_type='audio/wav',
+                filename=f"generated_audio_{request_id}.wav"
+            )
+        else:
+            logger.error(f"[{request_id}] Audio generation process failed to produce a file.")
+            # Ensure cleanup even if generation failed but temp dir was created
+            if temp_dir_path:
+                 background_tasks.add_task(cleanup_temp_dir, temp_dir_path)
+            raise HTTPException(status_code=500, detail="Audio generation failed.")
+
+    except Exception as e:
+        logger.error(f"[{request_id}] Unhandled exception in /generate_audio endpoint: {e}", exc_info=True)
+        # Ensure cleanup on unexpected errors
+        if temp_dir_path:
+            background_tasks.add_task(cleanup_temp_dir, temp_dir_path)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {e}")
+
+
+@router.get("/health")
+async def health_check():
+    """Basic health check endpoint."""
+    if pipeline_initialized and kokoro_pipeline is not None:
+        return {"status": "ok", "message": "Kokoro pipeline initialized."}
+    else:
+        return {"status": "error", "message": "Kokoro pipeline not initialized."}

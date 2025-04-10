@@ -4,6 +4,7 @@ from clarityhub import router as ch_router
 from farmx import router as farmx_router
 from fraud import router as fraud_router
 from policysense import router as ps_router
+from tts import router as tts_router
 import uvicorn
 
 app = FastAPI()
@@ -21,6 +22,7 @@ app.include_router(ch_router, prefix="/clarityhub", tags=["clarityhub"])
 app.include_router(farmx_router, prefix="/farmx", tags=["farmx"])
 app.include_router(fraud_router, prefix="/fraud", tags=["fraud"])
 app.include_router(ps_router, prefix="/policysense", tags=["policysense"])
+app.include_router(tts_router, prefix="/tts", tags=["tts"])
 
 @app.get("/")
 def read_root():
