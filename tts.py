@@ -21,6 +21,20 @@ import uvicorn
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# --- Language Mapping ---
+LANGUAGE_CODE_MAP = {
+    'en-US': 'a', # American English
+    'en-GB': 'b', # British English
+    'es-ES': 'e', # Spanish
+    'fr-FR': 'f', # French
+    'hi-IN': 'h', # Hindi
+    'it-IT': 'i', # Italian
+    'ja-JP': 'j', # Japanese
+    'pt-BR': 'p', # Brazilian Portuguese
+    'zh-CN': 'z', # Mandarin Chinese
+}
+DEFAULT_KOKORO_LANG_CODE = 'a' # Default if language not provided or not mapped
+
 # --- Import Kokoro ---
 try:
     from kokoro import KPipeline
@@ -29,13 +43,13 @@ except ImportError:
     KPipeline = None # Set to None if import fails
 
 # --- Kokoro Configuration (Read from environment) ---
-KOKORO_LANGUAGE_CODE = os.getenv("KOKORO_LANG_CODE", 'a') # Default to American English
+# KOKORO_LANGUAGE_CODE = os.getenv("KOKORO_LANG_CODE", 'a') # Removed - Language determined per request
 KOKORO_VOICE = os.getenv("KOKORO_VOICE", 'af_heart') # Default voice
 KOKORO_SAMPLING_RATE = 24000 # Kokoro's default sampling rate
 
 # --- Global Pipeline Variable ---
-kokoro_pipeline: Optional[KPipeline] = None
-pipeline_initialized = False
+# kokoro_pipeline: Optional[KPipeline] = None # Removed - Pipeline initialized per request
+# pipeline_initialized = False # Removed - Pipeline initialized per request
 
 # --- Helper Functions (Adapted from original script) ---
 PAUSE_REGEX = re.compile(r"(\[PAUSE=(\d+(?:\.\d+)?)\])")
@@ -65,28 +79,7 @@ def get_wav_duration(file_path: str) -> Optional[float]:
             logger.error(f"Pydub fallback failed for {file_path}: {pd_e}")
             return None
 
-def _initialize_kokoro_pipeline() -> Optional[KPipeline]:
-    """Initializes the Kokoro pipeline if not already done."""
-    global kokoro_pipeline, pipeline_initialized
-    if not pipeline_initialized:
-        if KPipeline is None:
-            logger.error("Kokoro library (KPipeline) is not available.")
-            return None
-        try:
-            logger.info(f"Initializing Kokoro pipeline (lang_code='{KOKORO_LANGUAGE_CODE}')... This may take a moment.")
-            # Consider making repo_id configurable via env var if needed
-            pipeline = KPipeline(lang_code=KOKORO_LANGUAGE_CODE)
-            kokoro_pipeline = pipeline
-            pipeline_initialized = True # Mark as initialized
-            logger.info("Kokoro pipeline initialized successfully.")
-        except Exception as e:
-            logger.error(f"Failed to initialize Kokoro pipeline: {e}", exc_info=True)
-            return None
-    elif kokoro_pipeline is None:
-         # Was marked initialized but failed previously, or some other issue
-         logger.error("Pipeline initialization previously failed or pipeline is None.")
-         return None
-    return kokoro_pipeline
+# Removed _initialize_kokoro_pipeline as it's done per request now
 
 def _generate_kokoro_segment(pipeline: KPipeline, text_segment: str, output_wav_path: str) -> Optional[float]:
     """Generates a single audio segment using Kokoro and returns its duration."""
@@ -122,16 +115,26 @@ def _generate_kokoro_segment(pipeline: KPipeline, text_segment: str, output_wav_
         logger.error(f"Error during Kokoro segment generation for text: {cleaned_text[:50]}... Error: {e}", exc_info=True)
         return None
 
-def _process_audio_generation(narration_script: str, request_id: str) -> Tuple[Optional[str], Optional[float], Optional[List[float]]]:
+def _process_audio_generation(narration_script: str, request_id: str, target_kokoro_code: str) -> Tuple[Optional[str], Optional[float], Optional[List[float]]]:
     """
     Core logic to generate audio, adapted for API context.
+    Initializes Kokoro pipeline per request based on target_kokoro_code.
     Returns final path, total duration, and segment durations.
     Saves file to a temporary location specific to the request.
     """
-    pipeline = _initialize_kokoro_pipeline()
-    if pipeline is None:
-        logger.error("Kokoro pipeline is not available. Cannot generate audio.")
+    # --- Initialize Kokoro Pipeline for this request ---
+    pipeline: Optional[KPipeline] = None
+    if KPipeline is None:
+        logger.error(f"[{request_id}] Kokoro library (KPipeline) is not available.")
         return None, None, None
+    try:
+        logger.info(f"[{request_id}] Initializing Kokoro pipeline (lang_code='{target_kokoro_code}')...")
+        pipeline = KPipeline(lang_code=target_kokoro_code)
+        logger.info(f"[{request_id}] Kokoro pipeline initialized successfully for lang_code='{target_kokoro_code}'.")
+    except Exception as e:
+        logger.error(f"[{request_id}] Failed to initialize Kokoro pipeline for lang_code='{target_kokoro_code}': {e}", exc_info=True)
+        return None, None, None
+    # --- End Pipeline Initialization ---
 
     # Create a unique temporary directory for this request's processing
     request_temp_dir = tempfile.mkdtemp(prefix=f"kokoro_api_{request_id}_")
@@ -221,16 +224,7 @@ def cleanup_temp_dir(temp_dir_path: str):
 # --- FastAPI App ---
 router = APIRouter()
 
-@router.on_event("startup")
-async def startup_event():
-    """Initialize the pipeline on startup."""
-    logger.info("API starting up. Initializing Kokoro pipeline...")
-    if _initialize_kokoro_pipeline() is None:
-        logger.error("Kokoro pipeline failed to initialize on startup!")
-        raise RuntimeError("Kokoro pipeline failed to initialize.")
-    else:
-        logger.info("Kokoro pipeline ready.")
-
+# Removed startup_event as pipeline is initialized per request
 
 @router.post("/generate_audio/",
           response_class=FileResponse,
@@ -239,29 +233,35 @@ async def startup_event():
                   "content": {"audio/wav": {}},
                   "description": "Successful audio generation. Returns WAV file.",
               },
-              422: {"description": "Validation Error (e.g., missing text)"},
-              500: {"description": "Internal Server Error (e.g., TTS failure)"},
-              503: {"description": "Service Unavailable (Kokoro not initialized)"}
+              422: {"description": "Validation Error (e.g., missing text or invalid language)"},
+              500: {"description": "Internal Server Error (e.g., TTS failure or pipeline init failure)"},
+              # 503 removed as initialization is per-request
           })
 async def generate_audio_endpoint(
     background_tasks: BackgroundTasks,
     payload: Dict[str, Any] = Body(...)
     ):
     """
-    Generates audio from the provided text using Kokoro TTS.
+    Generates audio from the provided text using Kokoro TTS, selecting language based on payload.
 
     - **payload**: JSON body containing:
         - **text** (str): The narration script, potentially with [PAUSE=...] markers.
+        - **language** (str, optional): The desired language code (e.g., "en-US", "hi-IN"). Defaults to American English if omitted or invalid.
     """
-    if not pipeline_initialized or kokoro_pipeline is None:
-         raise HTTPException(status_code=503, detail="Kokoro TTS service is not available.")
+    # Removed check for global pipeline_initialized
 
     narration_script = payload.get("text")
     if not narration_script or not isinstance(narration_script, str):
         raise HTTPException(status_code=422, detail="Missing or invalid 'text' field in request body.")
 
+    # Get language from payload and map to Kokoro code
+    requested_language = payload.get("language") # Can be None
+    target_kokoro_code = LANGUAGE_CODE_MAP.get(requested_language, DEFAULT_KOKORO_LANG_CODE) if requested_language else DEFAULT_KOKORO_LANG_CODE
+    logger.info(f"Requested language: '{requested_language}', Mapped Kokoro code: '{target_kokoro_code}'")
+
+
     request_id = str(uuid.uuid4()) # Unique ID for logging and temp files
-    logger.info(f"Received audio generation request {request_id}")
+    logger.info(f"Received audio generation request {request_id} for language '{requested_language or 'default'}'")
 
     # --- Perform Generation ---
     # Note: This runs synchronously within the request handler.
@@ -271,8 +271,9 @@ async def generate_audio_endpoint(
         # We need its path for cleanup later.
         temp_dir_path = os.path.join(tempfile.gettempdir(), f"kokoro_api_{request_id}_")
 
+        # Pass the determined Kokoro language code
         final_output_filepath, total_duration, segment_durations = _process_audio_generation(
-            narration_script, request_id
+            narration_script, request_id, target_kokoro_code
         )
 
         if final_output_filepath and os.path.exists(final_output_filepath):
@@ -301,8 +302,8 @@ async def generate_audio_endpoint(
 
 @router.get("/health")
 async def health_check():
-    """Basic health check endpoint."""
-    if pipeline_initialized and kokoro_pipeline is not None:
-        return {"status": "ok", "message": "Kokoro pipeline initialized."}
+    """Basic health check endpoint. Checks if Kokoro library is importable."""
+    if KPipeline is not None:
+         return {"status": "ok", "message": "Kokoro library (KPipeline) is available. Initialization happens per request."}
     else:
-        return {"status": "error", "message": "Kokoro pipeline not initialized."}
+         return {"status": "error", "message": "Kokoro library (KPipeline) is not available/importable."}
