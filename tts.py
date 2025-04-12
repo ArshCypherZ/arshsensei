@@ -35,6 +35,47 @@ LANGUAGE_CODE_MAP = {
 }
 DEFAULT_KOKORO_LANG_CODE = 'a' # Default if language not provided or not mapped
 
+# --- Voice Mapping ---
+SUPPORTED_VOICES = {
+    'a': [ # American English
+        'af_heart', 'af_alloy', 'af_aoede', 'af_bella', 'af_jessica',
+        'af_kore', 'af_nicole', 'af_nova', 'af_river', 'af_sarah',
+        'af_sky', 'am_adam', 'am_echo', 'am_eric', 'am_fenrir',
+        'am_liam', 'am_michael', 'am_onyx', 'am_puck', 'am_santa'
+    ],
+    'b': [ # British English
+        'bf_alice', 'bf_emma', 'bf_isabella', 'bf_lily', 'bm_daniel',
+        'bm_fable', 'bm_george', 'bm_lewis'
+    ],
+    'j': [ # Japanese
+        'jf_alpha', 'jf_gongitsune', 'jf_nezumi', 'jf_tebukuro', 'jm_kumo'
+    ],
+    'z': [ # Mandarin Chinese
+        'zf_xiaobei', 'zf_xiaoni', 'zf_xiaoxiao', 'zf_xiaoyi',
+        'zm_yunjian', 'zm_yunxi', 'zm_yunxia', 'zm_yunyang'
+    ],
+    'e': [ # Spanish
+        'ef_dora', 'em_alex', 'em_santa'
+    ],
+    'f': [ # French
+        'ff_siwis'
+    ],
+    'h': [ # Hindi
+        'hf_alpha', 'hf_beta', 'hm_omega', 'hm_psi'
+    ],
+    'i': [ # Italian
+        'if_sara', 'im_nicola'
+    ],
+    'p': [ # Brazilian Portuguese
+        'pf_dora', 'pm_alex', 'pm_santa'
+    ]
+}
+# Define default voices per language (e.g., the first one in the list or a known good one)
+DEFAULT_VOICES = {lang: voices[0] for lang, voices in SUPPORTED_VOICES.items()}
+# Optionally override specific defaults if the first isn't ideal
+DEFAULT_VOICES['a'] = 'af_heart' # Explicitly set default for American English
+
+
 # --- Import Kokoro ---
 try:
     from kokoro import KPipeline
@@ -44,7 +85,7 @@ except ImportError:
 
 # --- Kokoro Configuration (Read from environment) ---
 # KOKORO_LANGUAGE_CODE = os.getenv("KOKORO_LANG_CODE", 'a') # Removed - Language determined per request
-KOKORO_VOICE = os.getenv("KOKORO_VOICE", 'af_heart') # Default voice
+# KOKORO_VOICE = os.getenv("KOKORO_VOICE", 'af_heart') # Removed - Voice determined per request
 KOKORO_SAMPLING_RATE = 24000 # Kokoro's default sampling rate
 
 # --- Global Pipeline Variable ---
@@ -81,18 +122,19 @@ def get_wav_duration(file_path: str) -> Optional[float]:
 
 # Removed _initialize_kokoro_pipeline as it's done per request now
 
-def _generate_kokoro_segment(pipeline: KPipeline, text_segment: str, output_wav_path: str) -> Optional[float]:
-    """Generates a single audio segment using Kokoro and returns its duration."""
+def _generate_kokoro_segment(pipeline: KPipeline, text_segment: str, output_wav_path: str, voice_name: str) -> Optional[float]:
+    """Generates a single audio segment using Kokoro with a specific voice and returns its duration."""
     cleaned_text = PAUSE_REGEX.sub('', text_segment).strip()
     if not cleaned_text:
         logger.info("Skipping empty/marker-only text segment for Kokoro.")
         return 0.0
 
-    logger.debug(f"Sending to Kokoro: '{cleaned_text[:50]}...' (Voice: {KOKORO_VOICE})")
+    logger.debug(f"Sending to Kokoro: '{cleaned_text[:50]}...' (Voice: {voice_name})")
 
     try:
         start_time = time.time()
-        generator: Any = pipeline(cleaned_text, voice=KOKORO_VOICE, speed=1)
+        # Use the provided voice_name
+        generator: Any = pipeline(cleaned_text, voice=voice_name, speed=1)
 
         all_audio_data = []
         for _gs, _ps, audio_data in generator:
@@ -115,10 +157,10 @@ def _generate_kokoro_segment(pipeline: KPipeline, text_segment: str, output_wav_
         logger.error(f"Error during Kokoro segment generation for text: {cleaned_text[:50]}... Error: {e}", exc_info=True)
         return None
 
-def _process_audio_generation(narration_script: str, request_id: str, target_kokoro_code: str) -> Tuple[Optional[str], Optional[float], Optional[List[float]]]:
+def _process_audio_generation(narration_script: str, request_id: str, target_kokoro_code: str, target_voice: str) -> Tuple[Optional[str], Optional[float], Optional[List[float]]]:
     """
     Core logic to generate audio, adapted for API context.
-    Initializes Kokoro pipeline per request based on target_kokoro_code.
+    Initializes Kokoro pipeline per request based on target_kokoro_code and uses target_voice.
     Returns final path, total duration, and segment durations.
     Saves file to a temporary location specific to the request.
     """
@@ -170,7 +212,8 @@ def _process_audio_generation(narration_script: str, request_id: str, target_kok
                 if not text_segment: continue
 
                 segment_filename = os.path.join(temp_segment_dir, f"segment_{segment_index}.wav")
-                segment_duration = _generate_kokoro_segment(pipeline, text_segment, segment_filename)
+                # Pass the target_voice to the segment generation function
+                segment_duration = _generate_kokoro_segment(pipeline, text_segment, segment_filename, target_voice)
 
                 if segment_duration is not None:
                     if segment_duration > 0.01:
@@ -247,6 +290,7 @@ async def generate_audio_endpoint(
     - **payload**: JSON body containing:
         - **text** (str): The narration script, potentially with [PAUSE=...] markers.
         - **language** (str, optional): The desired language code (e.g., "en-US", "hi-IN"). Defaults to American English if omitted or invalid.
+        - **voice** (str, optional): The desired voice name (e.g., "af_heart", "bf_emma"). Defaults to a language-specific default if omitted or invalid.
     """
     # Removed check for global pipeline_initialized
 
@@ -259,9 +303,22 @@ async def generate_audio_endpoint(
     target_kokoro_code = LANGUAGE_CODE_MAP.get(requested_language, DEFAULT_KOKORO_LANG_CODE) if requested_language else DEFAULT_KOKORO_LANG_CODE
     logger.info(f"Requested language: '{requested_language}', Mapped Kokoro code: '{target_kokoro_code}'")
 
+    # Determine the target voice
+    requested_voice = payload.get("voice") # Can be None
+    target_voice = DEFAULT_VOICES.get(target_kokoro_code, list(SUPPORTED_VOICES.values())[0][0]) # Fallback to absolute first voice if lang somehow not in DEFAULT_VOICES
+
+    if requested_voice:
+        if target_kokoro_code in SUPPORTED_VOICES and requested_voice in SUPPORTED_VOICES[target_kokoro_code]:
+            target_voice = requested_voice
+            logger.info(f"Using requested voice: '{target_voice}' for language code '{target_kokoro_code}'")
+        else:
+            logger.warning(f"Requested voice '{requested_voice}' is not valid for language code '{target_kokoro_code}'. Falling back to default: '{target_voice}'")
+    else:
+        logger.info(f"No voice requested, using default for language code '{target_kokoro_code}': '{target_voice}'")
+
 
     request_id = str(uuid.uuid4()) # Unique ID for logging and temp files
-    logger.info(f"Received audio generation request {request_id} for language '{requested_language or 'default'}'")
+    logger.info(f"Received audio generation request {request_id} for language '{requested_language or 'default'}' and voice '{target_voice}'")
 
     # --- Perform Generation ---
     # Note: This runs synchronously within the request handler.
@@ -271,9 +328,9 @@ async def generate_audio_endpoint(
         # We need its path for cleanup later.
         temp_dir_path = os.path.join(tempfile.gettempdir(), f"kokoro_api_{request_id}_")
 
-        # Pass the determined Kokoro language code
+        # Pass the determined Kokoro language code and voice
         final_output_filepath, total_duration, segment_durations = _process_audio_generation(
-            narration_script, request_id, target_kokoro_code
+            narration_script, request_id, target_kokoro_code, target_voice
         )
 
         if final_output_filepath and os.path.exists(final_output_filepath):
