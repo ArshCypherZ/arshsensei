@@ -1,6 +1,7 @@
-from typing import List
+from typing import List, Union
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from enum import Enum
 from google import genai
 from dotenv import load_dotenv
 import os
@@ -25,17 +26,31 @@ def get_video_link(query, max_results=1):
     video_links = [f"https://www.youtube.com/watch?v={item['id']['videoId']}" for item in response.get("items", [])]
     return video_links if video_links else ["No video found"]
 
+# Enums for quiz types
+class DifficultyLevel(str, Enum):
+    beginner = "beginner"
+    intermediate = "intermediate"
+    advanced = "advanced"
+
+class QuestionType(str, Enum):
+    multiple_choice = "multiple-choice"
+    true_false = "true-false"
+    mixed = "mixed"
+
 # Models
 class InputData(BaseModel):
     syllabus: str
     subject: str
     class_level: str 
     exam: str
+    difficulty: str
+    timeline: str
+    priorKnowledge: str
 
 class Topic(BaseModel):
     name: str
     subtopics: List[str]
-    completion_time: int  # Days to complete
+    completion_time: int
     resources: List[str]
     youtube_link: str
 
@@ -45,14 +60,23 @@ class Input(BaseModel):
 class Output(BaseModel):
     answer: str
 
-class QuizQuestion(BaseModel):
+class MCQQuestion(BaseModel):
     question: str
-    options: List[str]
+    options: List[str] = Field(..., min_length=2)
     answer: str
+
+class TrueFalseQuestion(BaseModel):
+    question: str
+    options: List[str] = ["True", "False"]
+    answer: str
+
+QuizQuestionResponse = Union[MCQQuestion, TrueFalseQuestion]
 
 class QuizRequest(BaseModel):
     topic: str
-    num_questions: int = 5  # Default 5 MCQs
+    difficulty: DifficultyLevel
+    questionCount: int = Field(default=5, gt=0)
+    questionType: QuestionType
 
 class Flashcard(BaseModel):
     question: str
@@ -74,31 +98,39 @@ class FlashcardResponse(BaseModel):
 async def generate_topics(input_data: InputData):
     try:
         prompt = f"""
-        List topics for the following syllabus in JSON format.
+        Generate a detailed list of topics based on the following requirements, provided in JSON format.
 
         Syllabus: {input_data.syllabus}
-        
         Subject: {input_data.subject}
         Class Level: {input_data.class_level}
-        Exam: {input_data.exam}
+        Target Exam: {input_data.exam}
+        Difficulty Level: {input_data.difficulty}
+        Desired Timeline: {input_data.timeline}
+        Prior Knowledge: {input_data.priorKnowledge}
 
-        Use this JSON schema:
-        
-        Topic = {{'name': str, 'subtopics': list[str], 'completion_time': int, 'resources': list[str]}}
-        Return: list[Topic]
-
-        name: Name of the topic
-        subtopics: List of subtopics for the topic
-        completion_time: Number of days to complete the topic
-        resources: List of resources for the topic.
-
-        Note: For resources, mention recommended resources for each topic.
+        Provide output in this format:
+        [
+            {{
+                "name": "Topic Name",
+                "subtopics": ["sub1", "sub2"],
+                "completion_time": 5,
+                "resources": ["Resource A", "Resource B"]
+            }}
+        ]
         """
-        response = client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
-        topic_list = json.loads(response.text.strip("```json").strip("```"))
+
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=prompt,
+        )
+
+        topic_list = json.loads(response.text.strip("```json").strip("```").strip())
+
         for topic in topic_list:
-            topic["youtube_link"] = get_video_link(topic["name"])[0]
+            topic["youtube_link"] = (get_video_link(topic["name"]))[0]
+
         return topic_list
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -115,75 +147,102 @@ async def about_topic(inp: Input):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.post("/generate_quizzes/", response_model=List[QuizQuestion])
+@router.post("/generate_quizzes/", response_model=List[QuizQuestionResponse])
 async def generate_quizzes(quiz_request: QuizRequest):
     try:
         prompt = f"""
-        Generate {quiz_request.num_questions} multiple-choice questions (MCQs) for the topic: {quiz_request.topic}.
-        Provide output in JSON format using the schema: QuizQuestion = {{'question': str, 'options': list[str], 'answer': str}}
-        Each question should have four options, and the answer should be one of the options.
+        Generate {quiz_request.questionCount} quiz questions about the topic: "{quiz_request.topic}".
+        The difficulty level should be {quiz_request.difficulty.value}.
+        The question type should be {quiz_request.questionType.value}.
         """
+
+        if quiz_request.questionType == QuestionType.multiple_choice:
+            prompt += """
+        For multiple-choice questions, provide output as a JSON list using this schema:
+        {{
+            "question": "string",
+            "options": ["Option A", "Option B", "Option C", "Option D"],
+            "answer": "Option A"
+        }}
+        """
+        elif quiz_request.questionType == QuestionType.true_false:
+            prompt += """
+        For true/false questions, provide output as a JSON list using this schema:
+        {{
+            "question": "string",
+            "options": ["True", "False"],
+            "answer": "True" or "False"
+        }}
+        """
+        elif quiz_request.questionType == QuestionType.mixed:
+            prompt += f"""
+        Provide a mix of both multiple-choice and true/false questions (approx. half of each).
+        Output should be a JSON list using:
+        - MCQ: {{ "question": "string", "options": ["A", "B", "C", "D"], "answer": "string" }}
+        - True/False: {{ "question": "string", "options": ["True", "False"], "answer": "True" or "False" }}
+        """
+
+        prompt += "\nReturn ONLY the JSON list, no markdown or explanations."
+
         response = client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
-        return json.loads(response.text.strip("```json").strip("```"))
+        json_string = response.text.strip("```json").strip("```").strip()
+
+        try:
+            quiz_data = json.loads(json_string)
+            if not isinstance(quiz_data, list):
+                raise ValueError("Response is not a JSON list")
+
+            validated_list = []
+            for item in quiz_data:
+                if "options" in item and len(item["options"]) > 2:
+                    validated_list.append(MCQQuestion(**item))
+                elif "options" in item and item["options"] == ["True", "False"]:
+                    validated_list.append(TrueFalseQuestion(**item))
+                else:
+                    raise ValueError(f"Unrecognized question format: {item}")
+
+            return validated_list
+
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=500, detail="Invalid JSON from Gemini")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Error validating questions: {str(e)}")
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
+        raise HTTPException(status_code=500, detail=f"Failed to generate quizzes: {str(e)}")
 
 @router.post("/generate_flashcards", response_model=FlashcardResponse)
 async def generate_flashcards(request: FlashcardRequest):
     try:
-        # generating the flashcards using the API
         prompt = f"""
-            Generate {request.num_flashcards} flashcards on the
-            topic '{request.topic}' with difficulty
-            '{request.difficulty}'.
-            Make sure the flashcards follow the following guidelines
-            to ensure maximum retention for the user :
-                1. use active recall
-                2. phrase questions so that they make the user think, and NOT regurgitate
-                3. Allow cards that can be implemented with spaced repetition
-                4. keep the cards simple : one idea per card
-                5. avoid paragraphs : aim for short and clear prompts that get the mind running
-                6. add question like 'why', 'how', or 'when' if applicable to deepen understanding
-                7. Use Cloze Deletion : fill in the blanks style flashcards to help with definitions, formulae, and coding syntax     
-                8. Interleave between subtopics : mix up different topics to improve retention
+        Generate {request.num_flashcards} flashcards on the topic '{request.topic}' with difficulty '{request.difficulty}'.
+        Guidelines:
+        - Use active recall
+        - Phrase questions to provoke thinking
+        - Mix subtopics
+        - Keep them short and clear
+        - Use Cloze Deletion if helpful
 
-            Provide output in JSON format with the following schema:
-            {{
-                "flashcards": [
-                    {{
-                        "question": "<question>",
-                        "hint": "<hint>",
-                        "answer": "<answer>"
-                    }}
-                ]
-            }}
-            Ensure that the questions are clear and concise.
-            """
+        Provide output as:
+        {{
+            "flashcards": [
+                {{
+                    "question": "...",
+                    "hint": "...",
+                    "answer": "..."
+                }}
+            ]
+        }}
+        """
 
-        response = client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=prompt
-        )
+        response = client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
 
-        if not response.text:
-            raise HTTPException(status_code=500, detail="Empty response from Gemini API")
-
-        # parse the response to extract flashcards
-        flashcards_data = (response.text).strip("```json").strip("```")
-
-        try:
-            flashcards_data = json.loads(flashcards_data)
-        except json.JSONDecodeError:
-            raise HTTPException(status_code=500, detail="Failed to decode the JSON response")
-
-        # ensure and enforce proper structure for flashcards
+        flashcards_data = json.loads(response.text.strip("```json").strip("```").strip())
         if "flashcards" not in flashcards_data:
-            raise HTTPException(status_code=500, detail="Invalid response structure, 'flashcards' key missing")
+            raise HTTPException(status_code=500, detail="Missing flashcards in response")
 
         flashcards = [
-            Flashcard(question=fc['question'], hint=fc['hint'], answer=fc['answer'])
+            Flashcard(**fc)
             for fc in flashcards_data['flashcards']
         ]
 
