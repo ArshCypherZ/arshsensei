@@ -83,16 +83,10 @@ except ImportError:
     logger.error("FATAL: Failed to import KPipeline from kokoro. Make sure 'kokoro' is installed correctly.")
     KPipeline = None # Set to None if import fails
 
-# --- Kokoro Configuration (Read from environment) ---
-# KOKORO_LANGUAGE_CODE = os.getenv("KOKORO_LANG_CODE", 'a') # Removed - Language determined per request
-# KOKORO_VOICE = os.getenv("KOKORO_VOICE", 'af_heart') # Removed - Voice determined per request
+
 KOKORO_SAMPLING_RATE = 24000 # Kokoro's default sampling rate
 
-# --- Global Pipeline Variable ---
-# kokoro_pipeline: Optional[KPipeline] = None # Removed - Pipeline initialized per request
-# pipeline_initialized = False # Removed - Pipeline initialized per request
-
-# --- Helper Functions (Adapted from original script) ---
+# --- Helper Functions ---
 PAUSE_REGEX = re.compile(r"(\[PAUSE=(\d+(?:\.\d+)?)\])")
 
 def ensure_dir_exists(directory_path: str):
@@ -120,7 +114,6 @@ def get_wav_duration(file_path: str) -> Optional[float]:
             logger.error(f"Pydub fallback failed for {file_path}: {pd_e}")
             return None
 
-# Removed _initialize_kokoro_pipeline as it's done per request now
 
 def _generate_kokoro_segment(pipeline: KPipeline, text_segment: str, output_wav_path: str, voice_name: str) -> Optional[float]:
     """Generates a single audio segment using Kokoro with a specific voice and returns its duration."""
@@ -171,7 +164,7 @@ def _process_audio_generation(narration_script: str, request_id: str, target_kok
         return None, None, None
     try:
         logger.info(f"[{request_id}] Initializing Kokoro pipeline (lang_code='{target_kokoro_code}')...")
-        pipeline = KPipeline(lang_code=target_kokoro_code)
+        pipeline = KPipeline(repo_id='hexgrad/Kokoro-82M', lang_code=target_kokoro_code)
         logger.info(f"[{request_id}] Kokoro pipeline initialized successfully for lang_code='{target_kokoro_code}'.")
     except Exception as e:
         logger.error(f"[{request_id}] Failed to initialize Kokoro pipeline for lang_code='{target_kokoro_code}': {e}", exc_info=True)
@@ -267,8 +260,6 @@ def cleanup_temp_dir(temp_dir_path: str):
 # --- FastAPI App ---
 router = APIRouter()
 
-# Removed startup_event as pipeline is initialized per request
-
 @router.post("/generate_audio/",
           response_class=FileResponse,
           responses={
@@ -278,7 +269,6 @@ router = APIRouter()
               },
               422: {"description": "Validation Error (e.g., missing text or invalid language)"},
               500: {"description": "Internal Server Error (e.g., TTS failure or pipeline init failure)"},
-              # 503 removed as initialization is per-request
           })
 async def generate_audio_endpoint(
     background_tasks: BackgroundTasks,
@@ -292,7 +282,6 @@ async def generate_audio_endpoint(
         - **language** (str, optional): The desired language code (e.g., "en-US", "hi-IN"). Defaults to American English if omitted or invalid.
         - **voice** (str, optional): The desired voice name (e.g., "af_heart", "bf_emma"). Defaults to a language-specific default if omitted or invalid.
     """
-    # Removed check for global pipeline_initialized
 
     narration_script = payload.get("text")
     if not narration_script or not isinstance(narration_script, str):
