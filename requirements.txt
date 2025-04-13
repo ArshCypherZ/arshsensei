@@ -26,3 +26,7 @@ xgboost
 kokoro>=0.9.4
 soundfile
 pydub
+misaki[en]
+misaki[ja]
+misaki[zh]
+fugashi[unidic]
